@@ -162,7 +162,9 @@ after the last run).
 A Crontab like schedule also exists, see the section on `Crontab schedules`_.
 
 Like with :command:`cron`, the tasks may overlap if the first task doesn't complete
-before the next. If that's a concern you should use a locking
+before the next. If that's a concern you can set `no_overlap` on the entry to
+make the scheduler skip runs dispatched while a previous run of the same entry
+is still executing (see :ref:`beat-entry-fields` below), or use a locking
 strategy to ensure only one instance can run at a time (see for example
 :ref:`cookbook-task-serial`).
 
@@ -213,6 +215,80 @@ Available Fields
 
     By default `relative` is false, the frequency isn't rounded and will be
     relative to the time when :program:`celery beat` was started.
+
+* `no_overlap`
+
+    If `no_overlap` is true the scheduler checks, before dispatching a due
+    run, whether the previously dispatched run of this entry is still
+    executing.  If it is, the new run is skipped and recorded in the
+    entry's skip log (see :ref:`beat-skipped-executions`).
+
+    The state of the previous run is looked up in the result backend, so
+    this requires a result backend to be configured and results must not be
+    ignored (:setting:`task_ignore_result`).  If the state can't be
+    checked, a warning is logged and the run is dispatched anyway.
+
+    .. note::
+
+        A result that already expired from the backend is
+        indistinguishable from a run that's still pending, so
+        :setting:`result_expires` should be kept (much) longer than the
+        interval between this entry's runs.
+
+    By default `no_overlap` is false: a new run is dispatched at every
+    fire time, whether or not the previous run has finished.
+
+* `misfire_grace_time`
+
+    The maximum time, in seconds (or as a :class:`~datetime.timedelta`),
+    that a missed run may be late and still be dispatched.
+
+    If the scheduler was down (or otherwise late) and the scheduled fire
+    time is older than this grace time, the run is skipped and recorded in
+    the entry's skip log (see :ref:`beat-skipped-executions`) instead of
+    being dispatched.
+
+    By default `misfire_grace_time` is not set: missed runs are always
+    dispatched, no matter how late they are.
+
+.. _beat-skipped-executions:
+
+Skipped executions
+------------------
+
+When a due run is not dispatched -- because it was older than the entry's
+`misfire_grace_time`, or because `no_overlap` is enabled and the previous
+run was still executing -- the scheduler logs a warning and records the
+skip on the entry:
+
+.. code-block:: pycon
+
+    >>> entry = scheduler.schedule['my-periodic-task']
+    >>> entry.total_skip_count
+    3
+    >>> entry.skip_log[-1]
+    skip_record_t(reason='misfire',
+                  scheduled_at=datetime.datetime(2026, 9, 18, 4, 0,
+                                                 tzinfo=datetime.timezone.utc),
+                  skipped_at=datetime.datetime(2026, 9, 18, 9, 30,
+                                               tzinfo=datetime.timezone.utc),
+                  missed_count=11)
+
+Each record tells you why the run was skipped (``'misfire'`` or
+``'overlap'``), when it was supposed to run, when it was skipped, and --
+for fixed-interval schedules -- how many fire-times were missed.
+The log is bounded (the 100 most recent records are kept by default) and,
+like the rest of the entry state, it's persisted by
+:class:`~celery.beat.PersistentScheduler`, so skipped runs can be
+inspected even after :program:`celery beat` is restarted:
+
+.. code-block:: pycon
+
+    >>> from celery.beat import PersistentScheduler
+    >>> scheduler = PersistentScheduler(app, schedule_filename='celerybeat-schedule')
+    >>> for name, entry in scheduler.schedule.items():
+    ...     if entry.total_skip_count:
+    ...         print(name, entry.total_skip_count, entry.skip_log[-1])
 
 .. _beat-crontab:
 

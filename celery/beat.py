@@ -11,6 +11,7 @@ import time
 import traceback
 from calendar import timegm
 from collections import namedtuple
+from datetime import timedelta
 from functools import total_ordering
 from threading import Event, Thread
 
@@ -23,17 +24,50 @@ from kombu.utils.objects import cached_property
 from . import __version__, platforms, signals
 from .exceptions import reraise
 from .schedules import crontab, maybe_schedule
+from .states import UNREADY_STATES
 from .utils.functional import is_numeric_value
 from .utils.imports import load_extension_class_names, symbol_by_name
 from .utils.log import get_logger, iter_open_logger_fds
-from .utils.time import humanize_seconds, maybe_make_aware
+from .utils.time import humanize_seconds, maybe_make_aware, maybe_timedelta
 
 __all__ = (
     'SchedulingError', 'ScheduleEntry', 'Scheduler',
     'PersistentScheduler', 'Service', 'EmbeddedService',
+    'SKIP_REASON_MISFIRE', 'SKIP_REASON_OVERLAP', 'skip_record_t',
 )
 
 event_t = namedtuple('event_t', ('time', 'priority', 'entry'))
+
+#: Record of a skipped ("misfired") execution of a schedule entry.
+#:
+#: .. attribute:: reason
+#:
+#:     Why the run was skipped (one of the ``SKIP_REASON_*`` constants).
+#:
+#: .. attribute:: scheduled_at
+#:
+#:     When the skipped run was supposed to be dispatched.
+#:
+#: .. attribute:: skipped_at
+#:
+#:     When the scheduler decided to skip the run.
+#:
+#: .. attribute:: missed_count
+#:
+#:     Estimated number of scheduled fire-times collapsed into this skip,
+#:     including the skipped run itself.  Only exact for fixed-interval
+#:     schedules (:class:`~celery.schedules.schedule`); :const:`None`
+#:     when the number can't be determined (e.g. crontab schedules).
+skip_record_t = namedtuple(
+    'skip_record_t', ('reason', 'scheduled_at', 'skipped_at', 'missed_count'))
+
+#: Skip reason used when the run was older than the entry's
+#: ``misfire_grace_time``.
+SKIP_REASON_MISFIRE = 'misfire'
+
+#: Skip reason used when the previous run of the entry was still
+#: executing (``no_overlap`` entries only).
+SKIP_REASON_OVERLAP = 'overlap'
 
 logger = get_logger(__name__)
 debug, info, error, warning = (logger.debug, logger.info,
@@ -90,6 +124,9 @@ class ScheduleEntry:
         last_run_at (~datetime.datetime): see :attr:`last_run_at`.
         total_run_count (int): see :attr:`total_run_count`.
         relative (bool): Is the time relative to when the server starts?
+        no_overlap (bool): see :attr:`no_overlap`.
+        misfire_grace_time (float, ~datetime.timedelta):
+            see :attr:`misfire_grace_time`.
     """
 
     #: The task name
@@ -113,9 +150,49 @@ class ScheduleEntry:
     #: Total number of times this task has been scheduled.
     total_run_count = 0
 
+    #: Don't dispatch a new run while the previously dispatched run of
+    #: this entry is still executing.
+    #:
+    #: The state of the previous run is looked up in the result backend,
+    #: so this requires a result backend to be configured (and results
+    #: must not be ignored).  If the state can't be checked the run is
+    #: dispatched anyway, and a warning is logged.
+    #:
+    #: Note that a result that expired from the backend is
+    #: indistinguishable from a run that's still pending, so
+    #: :setting:`result_expires` should be kept (much) longer than the
+    #: interval between this entry's runs.
+    no_overlap = False
+
+    #: How late a missed run may be and still be dispatched, in seconds
+    #: (or as a :class:`~datetime.timedelta`).
+    #:
+    #: If the scheduler was down (or otherwise late) and the scheduled
+    #: fire time is older than this grace time, the run is skipped and
+    #: recorded in :attr:`skip_log` instead of being dispatched.
+    #: :const:`None` (the default) means missed runs are always
+    #: dispatched, no matter how late they are.
+    misfire_grace_time = None
+
+    #: Id of the task dispatched for the most recent run of this entry.
+    last_task_id = None
+
+    #: Total number of times a due run of this entry was skipped.
+    total_skip_count = 0
+
+    #: Recent skipped runs of this entry, as a list of
+    #: :class:`skip_record_t` (most recent last, bounded by
+    #: :attr:`skip_log_maxlen`).
+    skip_log = None
+
+    #: Maximum number of records kept in :attr:`skip_log`.
+    skip_log_maxlen = 100
+
     def __init__(self, name=None, task=None, last_run_at=None,
                  total_run_count=None, schedule=None, args=(), kwargs=None,
-                 options=None, relative=False, app=None):
+                 options=None, no_overlap=False, misfire_grace_time=None,
+                 last_task_id=None, total_skip_count=None, skip_log=None,
+                 relative=False, app=None):
         self.app = app
         self.name = name
         self.task = task
@@ -125,6 +202,11 @@ class ScheduleEntry:
         self.schedule = maybe_schedule(schedule, relative, app=self.app)
         self.last_run_at = last_run_at or self.default_now()
         self.total_run_count = total_run_count or 0
+        self.no_overlap = no_overlap
+        self.misfire_grace_time = maybe_timedelta(misfire_grace_time)
+        self.last_task_id = last_task_id
+        self.total_skip_count = total_skip_count or 0
+        self.skip_log = list(skip_log) if skip_log else []
 
     def default_now(self):
         return self.schedule.now() if self.schedule else self.app.now()
@@ -139,22 +221,41 @@ class ScheduleEntry:
         ))
     __next__ = next = _next_instance  # for 2to3
 
+    def record_skip(self, record):
+        """Return new instance with a skipped execution recorded.
+
+        The run count is left unchanged, but ``last_run_at`` is advanced
+        so that the schedule moves on to the next fire time.
+        """
+        keep = self.skip_log_maxlen - 1
+        return self.__class__(**dict(
+            self,
+            last_run_at=self.default_now(),
+            total_skip_count=self.total_skip_count + 1,
+            skip_log=(self.skip_log[-keep:] if keep else []) + [record],
+        ))
+
     def __reduce__(self):
         return self.__class__, (
             self.name, self.task, self.last_run_at, self.total_run_count,
             self.schedule, self.args, self.kwargs, self.options,
+            self.no_overlap, self.misfire_grace_time, self.last_task_id,
+            self.total_skip_count, self.skip_log,
         )
 
     def update(self, other):
         """Update values from another entry.
 
         Will only update "editable" fields:
-            ``task``, ``schedule``, ``args``, ``kwargs``, ``options``.
+            ``task``, ``schedule``, ``args``, ``kwargs``, ``options``,
+            ``no_overlap``, ``misfire_grace_time``.
         """
         self.__dict__.update({
             'task': other.task, 'schedule': other.schedule,
             'args': other.args, 'kwargs': other.kwargs,
             'options': other.options,
+            'no_overlap': other.no_overlap,
+            'misfire_grace_time': other.misfire_grace_time,
         })
 
     def is_due(self):
@@ -183,7 +284,8 @@ class ScheduleEntry:
         return NotImplemented
 
     def editable_fields_equal(self, other):
-        for attr in ('task', 'args', 'kwargs', 'options', 'schedule'):
+        for attr in ('task', 'args', 'kwargs', 'options', 'schedule',
+                     'no_overlap', 'misfire_grace_time'):
             if getattr(self, attr) != getattr(other, attr):
                 return False
         return True
@@ -192,7 +294,8 @@ class ScheduleEntry:
         """Test schedule entries equality.
 
         Will only compare "editable" fields:
-        ``task``, ``schedule``, ``args``, ``kwargs``, ``options``.
+        ``task``, ``schedule``, ``args``, ``kwargs``, ``options``,
+        ``no_overlap``, ``misfire_grace_time``.
         """
         return self.editable_fields_equal(other)
 
@@ -258,6 +361,7 @@ class Scheduler:
         self.Producer = Producer or app.amqp.Producer
         self._heap = None
         self.old_schedulers = None
+        self._no_overlap_warned = set()
         self.sync_every_tasks = (
             app.conf.beat_sync_every if sync_every_tasks is None
             else sync_every_tasks)
@@ -287,6 +391,7 @@ class Scheduler:
                 debug('%s sent. id->%s', entry.task, result.id)
             else:
                 debug('%s sent.', entry.task)
+            return result
 
     def adjust(self, n, drift=-0.010):
         if n and n > 0:
@@ -350,8 +455,20 @@ class Scheduler:
         if is_due:
             verify = heappop(H)
             if verify is event:
-                next_entry = self.reserve(entry)
-                self.apply_entry(entry, producer=self.producer)
+                skip_record = self.should_skip(entry)
+                if skip_record is not None:
+                    next_entry = self.skip_entry(entry, skip_record)
+                else:
+                    next_entry = self.reserve(entry)
+                    result = self.apply_entry(entry, producer=self.producer)
+                    task_id = getattr(result, 'id', None)
+                    if task_id is not None:
+                        next_entry.last_task_id = task_id
+                        # apply_async may have synced the schedule store,
+                        # and a writeback shelve drops its cache on sync:
+                        # make sure the stored entry is this same object.
+                        if self.schedule.get(entry.name) is not next_entry:
+                            self.schedule[entry.name] = next_entry
                 heappush(H, event_t(self._when(next_entry, next_time_to_run),
                                     event[1], next_entry))
                 return 0
@@ -388,6 +505,111 @@ class Scheduler:
     def reserve(self, entry):
         new_entry = self.schedule[entry.name] = next(entry)
         return new_entry
+
+    def should_skip(self, entry):
+        """Check if a due entry must be skipped instead of dispatched.
+
+        Returns:
+            skip_record_t: record describing the skipped run, or
+                :const:`None` if the entry should be dispatched as usual.
+        """
+        if entry.misfire_grace_time is None and not entry.no_overlap:
+            return None
+        lateness = self._due_lateness(entry)
+        return (self._misfire_record(entry, lateness) or
+                self._overlap_record(entry, lateness))
+
+    def skip_entry(self, entry, record):
+        """Record a skipped run of a due entry instead of dispatching it."""
+        new_entry = self.schedule[entry.name] = entry.record_skip(record)
+        warning(
+            'Scheduler: Skipping due task %s (%s): %s '
+            '[scheduled at %s, total skips: %s]',
+            entry.name, entry.task, record.reason,
+            record.scheduled_at, new_entry.total_skip_count)
+        self._tasks_since_sync += 1
+        if self.should_sync():
+            self._do_sync()
+        return new_entry
+
+    def _due_lateness(self, entry):
+        """Return how late the current due run of the entry is, in seconds."""
+        try:
+            remaining = entry.schedule.remaining_estimate(entry.last_run_at)
+        except NotImplementedError:
+            # custom schedules are not required to implement
+            # remaining_estimate(): treat the run as on time.
+            return 0.0
+        return max(-remaining.total_seconds(), 0.0)
+
+    def _misfire_record(self, entry, lateness):
+        grace = maybe_timedelta(entry.misfire_grace_time)
+        if grace is None or lateness <= grace.total_seconds():
+            return None
+        now = entry.default_now()
+        return skip_record_t(
+            reason=SKIP_REASON_MISFIRE,
+            scheduled_at=now - timedelta(seconds=lateness),
+            skipped_at=now,
+            missed_count=self._missed_count(entry, lateness),
+        )
+
+    def _missed_count(self, entry, lateness):
+        # Number of fire-times between last_run_at and now, inclusive.
+        # Only exact for fixed-interval schedules.
+        run_every = getattr(entry.schedule, 'run_every', None)
+        if run_every:
+            seconds = run_every.total_seconds()
+            if seconds > 0:
+                return 1 + int(lateness // seconds)
+        return None
+
+    def _overlap_record(self, entry, lateness):
+        if not entry.no_overlap or not entry.last_task_id:
+            return None
+        if self._results_ignored(entry):
+            self._warn_overlap_check_unavailable(
+                entry, 'task results are ignored')
+            return None
+        try:
+            state = self._task_state(entry.last_task_id)
+        except NotImplementedError:
+            # raised by the disabled result backend.
+            self._warn_overlap_check_unavailable(
+                entry, 'no result backend is configured')
+            return None
+        except Exception as exc:  # pylint: disable=broad-except
+            error('beat: Cannot check state of task %s for entry %s: %r. '
+                  'Dispatching anyway.',
+                  entry.last_task_id, entry.name, exc)
+            return None
+        if state not in UNREADY_STATES:
+            return None
+        now = entry.default_now()
+        return skip_record_t(
+            reason=SKIP_REASON_OVERLAP,
+            scheduled_at=now - timedelta(seconds=lateness),
+            skipped_at=now,
+            missed_count=None,
+        )
+
+    def _task_state(self, task_id):
+        return self.app.AsyncResult(task_id).state
+
+    def _results_ignored(self, entry):
+        task = self.app.tasks.get(entry.task)
+        ignore_result = getattr(task, 'ignore_result', None)
+        if ignore_result is None:
+            ignore_result = self.app.conf.task_ignore_result
+        return bool(ignore_result)
+
+    def _warn_overlap_check_unavailable(self, entry, reason):
+        if entry.name not in self._no_overlap_warned:
+            self._no_overlap_warned.add(entry.name)
+            warning(
+                'beat: Entry %s has no_overlap enabled, but %s: '
+                'cannot detect overlapping runs, dispatching anyway.',
+                entry.name, reason)
 
     def apply_async(self, entry, producer=None, advance=True, **kwargs):
         # Update time-stamps and run counts before we actually execute,

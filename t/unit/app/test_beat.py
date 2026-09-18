@@ -128,6 +128,77 @@ class test_ScheduleEntry:
         assert entry.kwargs == {'callback': 'foo.bar.baz'}
         assert entry.options == {'routing_key': 'urgent'}
 
+    def test_skip_fields_default(self):
+        entry = self.create_entry()
+        assert entry.no_overlap is False
+        assert entry.misfire_grace_time is None
+        assert entry.last_task_id is None
+        assert entry.total_skip_count == 0
+        assert entry.skip_log == []
+
+    def test_misfire_grace_time_accepts_seconds(self):
+        entry = self.create_entry(misfire_grace_time=30)
+        assert entry.misfire_grace_time == timedelta(seconds=30)
+
+    def test_record_skip(self):
+        entry = self.create_entry()
+        record = beat.skip_record_t(
+            reason=beat.SKIP_REASON_MISFIRE,
+            scheduled_at=entry.last_run_at,
+            skipped_at=self.app.now(),
+            missed_count=3)
+        skipped = entry.record_skip(record)
+        assert skipped.total_skip_count == 1
+        assert skipped.skip_log == [record]
+        # the run count is not increased, but the schedule moves on.
+        assert skipped.total_run_count == entry.total_run_count
+        assert skipped.last_run_at >= entry.last_run_at
+        # the original entry is unchanged.
+        assert entry.total_skip_count == 0
+        assert entry.skip_log == []
+
+    def test_record_skip_bounded_log(self):
+        entry = self.create_entry()
+        records = [
+            beat.skip_record_t('misfire', None, None, i) for i in range(5)
+        ]
+        with patch.object(beat.ScheduleEntry, 'skip_log_maxlen', 3):
+            for record in records:
+                entry = entry.record_skip(record)
+        assert entry.total_skip_count == 5
+        assert entry.skip_log == records[-3:]
+
+    def test_reduce_skip_fields(self):
+        entry = self.create_entry(
+            no_overlap=True, misfire_grace_time=30,
+            last_task_id='task-id', total_skip_count=2,
+            skip_log=[beat.skip_record_t('misfire', None, None, 1)])
+        fun, args = entry.__reduce__()
+        res = fun(*args)
+        assert res.no_overlap is True
+        assert res.misfire_grace_time == timedelta(seconds=30)
+        assert res.last_task_id == 'task-id'
+        assert res.total_skip_count == 2
+        assert res.skip_log == entry.skip_log
+
+    def test_pickle_skip_fields(self):
+        entry = self.create_entry(
+            no_overlap=True, total_skip_count=1,
+            skip_log=[beat.skip_record_t('overlap', None, None, None)])
+        res = loads(dumps(entry))
+        assert res.no_overlap is True
+        assert res.total_skip_count == 1
+        assert res.skip_log == entry.skip_log
+
+    def test_update_skip_fields(self):
+        entry = self.create_entry(total_skip_count=3)
+        entry2 = self.create_entry(no_overlap=True, misfire_grace_time=60)
+        entry.update(entry2)
+        assert entry.no_overlap is True
+        assert entry.misfire_grace_time == timedelta(seconds=60)
+        # runtime state is not an editable field.
+        assert entry.total_skip_count == 3
+
 
 class mScheduler(beat.Scheduler):
 
@@ -446,6 +517,169 @@ class test_Scheduler:
                       schedule=mocked_schedule(False, None))
         assert scheduler.tick() == scheduler.max_interval
 
+    def test_should_skip_default_entry(self):
+        scheduler = mScheduler(app=self.app)
+        entry = scheduler.Entry(name='x', task='tasks.add', app=self.app)
+        assert scheduler.should_skip(entry) is None
+
+    def test_tick_misfire_beyond_grace_skips(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_misfire_beyond_grace',
+                      task='tasks.add',
+                      schedule=schedule(10),
+                      last_run_at=self.app.now() - timedelta(hours=1),
+                      misfire_grace_time=60)
+        assert scheduler.tick() == 0
+        assert scheduler.sent == []
+        entry = scheduler.schedule['test_misfire_beyond_grace']
+        assert entry.total_skip_count == 1
+        assert entry.total_run_count == 0
+        record, = entry.skip_log
+        assert record.reason == beat.SKIP_REASON_MISFIRE
+        assert record.missed_count == 360
+        assert record.scheduled_at < record.skipped_at
+        # last_run_at was advanced: the entry is not due again right away.
+        assert scheduler.tick() != 0
+
+    def test_tick_misfire_within_grace_fires(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_misfire_within_grace',
+                      task='tasks.add',
+                      schedule=schedule(10),
+                      last_run_at=self.app.now() - timedelta(seconds=15),
+                      misfire_grace_time=60)
+        assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+        entry = scheduler.schedule['test_misfire_within_grace']
+        assert entry.total_run_count == 1
+        assert entry.total_skip_count == 0
+
+    def test_tick_misfire_crontab_missed_count_unknown(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_misfire_crontab',
+                      task='tasks.add',
+                      schedule=crontab(minute='0'),
+                      last_run_at=self.app.now() - timedelta(days=2),
+                      misfire_grace_time=300)
+        assert scheduler.tick() == 0
+        assert scheduler.sent == []
+        entry = scheduler.schedule['test_misfire_crontab']
+        assert entry.total_skip_count == 1
+        record, = entry.skip_log
+        assert record.reason == beat.SKIP_REASON_MISFIRE
+        assert record.missed_count is None
+
+    def test_tick_records_last_task_id(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_records_last_task_id',
+                      task='tasks.add',
+                      schedule=schedule(10),
+                      last_run_at=self.app.now() - timedelta(seconds=30))
+        assert scheduler.tick() == 0
+        entry = scheduler.schedule['test_records_last_task_id']
+        assert entry.last_task_id
+
+    def test_tick_no_overlap(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_no_overlap',
+                      task='tasks.add',
+                      schedule=schedule(10),
+                      last_run_at=self.app.now() - timedelta(seconds=30),
+                      no_overlap=True)
+        # first run: nothing tracked yet, dispatched normally.
+        assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+        entry = scheduler.schedule['test_no_overlap']
+        assert entry.last_task_id
+        assert entry.total_run_count == 1
+
+        # previous run still executing: this run is skipped.
+        entry.last_run_at = self.app.now() - timedelta(seconds=30)
+        with patch.object(scheduler, '_task_state', return_value='STARTED'):
+            assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+        entry = scheduler.schedule['test_no_overlap']
+        assert entry.total_run_count == 1
+        assert entry.total_skip_count == 1
+        record, = entry.skip_log
+        assert record.reason == beat.SKIP_REASON_OVERLAP
+        assert record.missed_count is None
+
+        # previous run finished: dispatched again.
+        entry.last_run_at = self.app.now() - timedelta(seconds=30)
+        with patch.object(scheduler, '_task_state', return_value='SUCCESS'):
+            assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 2
+        entry = scheduler.schedule['test_no_overlap']
+        assert entry.total_run_count == 2
+        assert entry.total_skip_count == 1
+
+    def test_tick_no_overlap_without_backend_fires_anyway(self):
+        scheduler = mScheduler(app=self.app)
+        name = 'test_no_overlap_no_backend'
+        scheduler.add(name=name,
+                      task='tasks.add',
+                      schedule=schedule(10),
+                      last_run_at=self.app.now() - timedelta(seconds=30),
+                      no_overlap=True, last_task_id='task-id-1')
+        with patch('celery.beat.warning') as warning, \
+                patch.object(scheduler, '_task_state',
+                             side_effect=NotImplementedError('no backend')):
+            assert scheduler.tick() == 0
+            scheduler.schedule[name].last_run_at = (
+                self.app.now() - timedelta(seconds=30))
+            assert scheduler.tick() == 0
+        # fail-open: both runs dispatched, warning logged only once.
+        assert len(scheduler.sent) == 2
+        assert warning.call_count == 1
+        assert scheduler.schedule[name].total_skip_count == 0
+
+    def test_tick_no_overlap_ignore_result_fires_anyway(self):
+        self.app.conf.task_ignore_result = True
+        try:
+            scheduler = mScheduler(app=self.app)
+            scheduler.add(name='test_no_overlap_ignore_result',
+                          task='tasks.add',
+                          schedule=schedule(10),
+                          last_run_at=self.app.now() - timedelta(seconds=30),
+                          no_overlap=True, last_task_id='task-id-1')
+            with patch('celery.beat.warning') as warning:
+                assert scheduler.tick() == 0
+            assert len(scheduler.sent) == 1
+            warning.assert_called()
+        finally:
+            self.app.conf.task_ignore_result = False
+
+    def test_tick_no_overlap_task_ignore_result_fires_anyway(self):
+        @self.app.task(shared=False, ignore_result=True)
+        def ignored():
+            pass
+        ignored.apply_async = Mock(
+            name='ignored.apply_async',
+            return_value=self.app.AsyncResult('task-id-2'))
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_no_overlap_task_ignore_result',
+                      task=ignored.name,
+                      schedule=schedule(10),
+                      last_run_at=self.app.now() - timedelta(seconds=30),
+                      no_overlap=True, last_task_id='task-id-1')
+        assert scheduler.tick() == 0
+        ignored.apply_async.assert_called()
+
+    def test_tick_no_overlap_backend_error_fires_anyway(self):
+        scheduler = mScheduler(app=self.app)
+        scheduler.add(name='test_no_overlap_backend_error',
+                      task='tasks.add',
+                      schedule=schedule(10),
+                      last_run_at=self.app.now() - timedelta(seconds=30),
+                      no_overlap=True, last_task_id='task-id-1')
+        with patch('celery.beat.error') as error, \
+                patch.object(scheduler, '_task_state',
+                             side_effect=KeyError('connection lost')):
+            assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+        error.assert_called()
+
     def test_interface(self):
         scheduler = mScheduler(app=self.app)
         scheduler.sync()
@@ -492,7 +726,7 @@ class test_Scheduler:
         assert scheduler._heap == [event_t(1, 5, scheduler.schedule['foo'])]
 
     def create_schedule_entry(self, schedule=None, args=(), kwargs={},
-                              options={}, task=None):
+                              options={}, task=None, **entry_kwargs):
         entry = {
             'name': 'celery.unittest.add',
             'schedule': schedule,
@@ -502,7 +736,7 @@ class test_Scheduler:
             'options': options,
             'task': task
         }
-        return beat.ScheduleEntry(**dict(entry))
+        return beat.ScheduleEntry(**dict(entry, **entry_kwargs))
 
     def test_schedule_equal_schedule_vs_schedule_success(self):
         scheduler = beat.Scheduler(app=self.app)
@@ -538,6 +772,31 @@ class test_Scheduler:
         scheduler = beat.Scheduler(app=self.app)
         a = {'a': self.create_schedule_entry(schedule=schedule(5))}
         b = {'b': self.create_schedule_entry(schedule=schedule(5))}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_no_overlap_vs_no_overlap_success(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(no_overlap=True)}
+        b = {'a': self.create_schedule_entry(no_overlap=True)}
+        assert scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_no_overlap_vs_no_overlap_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(no_overlap=True)}
+        b = {'a': self.create_schedule_entry(no_overlap=False)}
+        assert not scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_misfire_grace_time_success(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(misfire_grace_time=10)}
+        b = {'a': self.create_schedule_entry(
+            misfire_grace_time=timedelta(seconds=10))}
+        assert scheduler.schedules_equal(a, b)
+
+    def test_schedule_equal_misfire_grace_time_fail(self):
+        scheduler = beat.Scheduler(app=self.app)
+        a = {'a': self.create_schedule_entry(misfire_grace_time=10)}
+        b = {'a': self.create_schedule_entry(misfire_grace_time=20)}
         assert not scheduler.schedules_equal(a, b)
 
     def test_schedule_equal_args_vs_args_success(self):
@@ -811,6 +1070,71 @@ class test_PersistentScheduler:
             item['task'] for item in scheduler.sent}
         # ensure next call on the beginning of next min
         assert abs(60 - cur_seconds - delay) < 1
+
+    def test_tick_last_task_id_survives_sync_and_restart(
+            self, tmp_path, depends_on_current_app):
+        # shelve drops its writeback cache on sync(), so the entry stored
+        # in the schedule is a different object after apply_async synced:
+        # last_task_id must still end up in the stored entry.
+        filename = str(tmp_path / 'celerybeat-schedule')
+        self.app.conf.beat_schedule = {
+            'persisted': {'task': 'tasks.add', 'schedule': 10.0},
+        }
+        try:
+            scheduler = beat.PersistentScheduler(
+                app=self.app, schedule_filename=filename)
+            entry = scheduler.schedule['persisted']
+            entry.last_run_at = self.app.now() - timedelta(seconds=30)
+            result = self.app.AsyncResult('task-id-9')
+            with patch.object(scheduler, 'send_task', return_value=result):
+                assert scheduler.tick() == 0
+            stored = scheduler.schedule['persisted']
+            assert stored.last_task_id == 'task-id-9'
+            scheduler.close()
+
+            restarted = beat.PersistentScheduler(
+                app=self.app, schedule_filename=filename)
+            try:
+                entry = restarted.schedule['persisted']
+                assert entry.last_task_id == 'task-id-9'
+                assert entry.total_run_count == 1
+            finally:
+                restarted.close()
+        finally:
+            self.app.conf.beat_schedule = {}
+
+    def test_tick_skip_records_survive_restart(
+            self, tmp_path, depends_on_current_app):
+        filename = str(tmp_path / 'celerybeat-schedule')
+        self.app.conf.beat_schedule = {
+            'skipped': {'task': 'tasks.add', 'schedule': 10.0,
+                        'misfire_grace_time': 60},
+        }
+        try:
+            scheduler = beat.PersistentScheduler(
+                app=self.app, schedule_filename=filename)
+            entry = scheduler.schedule['skipped']
+            entry.last_run_at = self.app.now() - timedelta(hours=1)
+            with patch.object(scheduler, 'send_task') as send_task:
+                assert scheduler.tick() == 0
+                send_task.assert_not_called()
+            entry = scheduler.schedule['skipped']
+            assert entry.total_skip_count == 1
+            assert entry.skip_log[0].reason == beat.SKIP_REASON_MISFIRE
+            scheduler.close()
+
+            restarted = beat.PersistentScheduler(
+                app=self.app, schedule_filename=filename)
+            try:
+                entry = restarted.schedule['skipped']
+                assert entry.total_skip_count == 1
+                record, = entry.skip_log
+                assert record.reason == beat.SKIP_REASON_MISFIRE
+                assert record.missed_count == 360
+            finally:
+                restarted.close()
+        finally:
+            self.app.conf.beat_schedule = {}
 
 
 class test_Service:
