@@ -162,7 +162,9 @@ after the last run).
 A Crontab like schedule also exists, see the section on `Crontab schedules`_.
 
 Like with :command:`cron`, the tasks may overlap if the first task doesn't complete
-before the next. If that's a concern you should use a locking
+before the next. If that's a concern you can set the ``no_overlap`` field of the
+entry to skip new runs while the previous one is still active (see
+:ref:`beat-entry-fields`), or use a locking
 strategy to ensure only one instance can run at a time (see for example
 :ref:`cookbook-task-serial`).
 
@@ -213,6 +215,63 @@ Available Fields
 
     By default `relative` is false, the frequency isn't rounded and will be
     relative to the time when :program:`celery beat` was started.
+
+* `no_overlap`
+
+    If true, a new run is skipped while the previously dispatched run of
+    this entry is still active, so that the task never overlaps with
+    itself.
+
+    Detecting whether the previous run is still active requires a result
+    backend to be configured.  Skipped runs are recorded, see
+    :ref:`beat-skipped-runs`.
+
+* `misfire_grace_time`
+
+    The maximum number of seconds a run may be late and still be
+    dispatched (a :class:`~datetime.timedelta` is also accepted).
+
+    Runs can be late when :program:`celery beat` is restarted or busy:
+    if the delay exceeds this grace time the run is skipped instead of
+    dispatched, and the skip is recorded (see :ref:`beat-skipped-runs`).
+    By default (``None``) runs are always dispatched, no matter how late
+    they are.
+
+.. _beat-skipped-runs:
+
+Skipped runs
+============
+
+When a run is skipped because it was too late (``misfire_grace_time``) or
+because the previous run was still active (``no_overlap``), the scheduler
+logs a warning and keeps a record of the skip.  Each record contains the
+entry name, when the run was scheduled, when it was skipped, the reason
+(``'misfire'`` or ``'overlap'``), a human readable detail message, and an
+estimate of how many scheduled runs were coalesced into the skipped one
+(the estimate is only available for fixed-interval schedules).
+
+The records are available on the scheduler instance:
+
+.. code-block:: python
+
+    >>> scheduler.skipped_runs()            # all records
+    >>> scheduler.skipped_runs('my-entry')  # records for one entry only
+
+and every entry also keeps an estimated count of skipped runs in its
+``total_skip_count`` attribute.
+
+The default :class:`~celery.beat.PersistentScheduler` used by
+:program:`celery beat` stores the records in the schedule database, so
+they can also be inspected after a restart.  At most
+``Scheduler.max_skip_records`` (1000 by default) records are kept.
+
+.. note::
+
+    ``no_overlap`` requires a result backend to be configured, as the
+    scheduler checks the state of the previously dispatched task.  Note
+    that a task whose message was lost in transit is indistinguishable
+    from one still waiting to run (both are ``PENDING``), and will keep
+    blocking new runs.
 
 .. _beat-crontab:
 

@@ -128,6 +128,63 @@ class test_ScheduleEntry:
         assert entry.kwargs == {'callback': 'foo.bar.baz'}
         assert entry.options == {'routing_key': 'urgent'}
 
+    def test_skip_control_defaults(self):
+        entry = self.create_entry()
+        assert entry.no_overlap is False
+        assert entry.misfire_grace_time is None
+        assert entry.next_run_at is None
+        assert entry.last_task_id is None
+        assert entry.total_skip_count == 0
+
+    def test_misfire_grace_time_coerced_to_timedelta(self):
+        entry = self.create_entry(misfire_grace_time=30)
+        assert entry.misfire_grace_time == timedelta(seconds=30)
+
+    def test_next_preserves_skip_control_fields(self):
+        next_run_at = datetime.now(timezone.utc)
+        entry = self.create_entry(no_overlap=True, misfire_grace_time=30,
+                                  next_run_at=next_run_at,
+                                  last_task_id='task-id-1',
+                                  total_skip_count=3)
+        next_entry = entry.next()
+        assert next_entry.no_overlap is True
+        assert next_entry.misfire_grace_time == timedelta(seconds=30)
+        assert next_entry.next_run_at == next_run_at
+        assert next_entry.last_task_id == 'task-id-1'
+        assert next_entry.total_skip_count == 3
+
+    def test_reduce_preserves_skip_control_fields(self):
+        next_run_at = datetime.now(timezone.utc)
+        entry = self.create_entry(no_overlap=True,
+                                  misfire_grace_time=timedelta(seconds=5),
+                                  next_run_at=next_run_at,
+                                  last_task_id='task-id-1',
+                                  total_skip_count=3)
+        res = loads(dumps(entry))
+        assert res.no_overlap is True
+        assert res.misfire_grace_time == timedelta(seconds=5)
+        assert res.next_run_at == next_run_at
+        assert res.last_task_id == 'task-id-1'
+        assert res.total_skip_count == 3
+
+    def test_update_copies_skip_control_fields(self):
+        entry = self.create_entry()
+        entry2 = self.create_entry(no_overlap=True, misfire_grace_time=10)
+        entry.update(entry2)
+        assert entry.no_overlap is True
+        assert entry.misfire_grace_time == timedelta(seconds=10)
+
+    def test_editable_fields_equal_skip_control(self):
+        entry = self.create_entry()
+        other = self.create_entry()
+        assert entry.editable_fields_equal(other)
+        assert entry == other
+        other.no_overlap = True
+        assert not entry.editable_fields_equal(other)
+        other.no_overlap = False
+        other.misfire_grace_time = timedelta(seconds=10)
+        assert not entry.editable_fields_equal(other)
+
 
 class mScheduler(beat.Scheduler):
 
@@ -607,6 +664,155 @@ class test_Scheduler:
         assert scheduler.schedules_equal(a, b)
 
 
+class test_Scheduler_skip_control:
+
+    def add_entry(self, scheduler, name, now, next_delay=300, **fields):
+        sched = mocked_schedule(True, next_delay, nowfun=lambda: now)
+        entry = scheduler.add(name=name, task='tasks.add',
+                              schedule=sched, **fields)
+        return entry, sched
+
+    def test_misfire_beyond_grace_time_is_skipped(self):
+        scheduler = mScheduler(app=self.app)
+        now = datetime.now(timezone.utc)
+        entry, sched = self.add_entry(scheduler, 'late', now,
+                                      misfire_grace_time=60)
+        sched.run_every = timedelta(seconds=600)
+        entry.next_run_at = now - timedelta(seconds=3600)
+
+        assert scheduler.tick() == 0
+        assert not scheduler.sent
+
+        skipped = scheduler.skipped_runs()
+        assert len(skipped) == 1
+        record = skipped[0]
+        assert record.entry == 'late'
+        assert record.reason == beat.SKIP_REASON_MISFIRE
+        assert record.scheduled_at == now - timedelta(seconds=3600)
+        assert record.skipped_at == now
+        assert record.missed_count == 7
+
+        # the schedule moves on: the entry was reserved and the
+        # estimated number of missed runs was recorded.
+        current = scheduler.schedule['late']
+        assert current.total_run_count == 1
+        assert current.total_skip_count == 7
+        assert current.last_run_at == now
+        assert current.next_run_at == now + timedelta(seconds=300)
+
+        # the next run is on time again and dispatched normally.
+        assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+
+    def test_misfire_within_grace_time_is_sent(self):
+        scheduler = mScheduler(app=self.app)
+        now = datetime.now(timezone.utc)
+        entry, _ = self.add_entry(scheduler, 'slightly-late', now,
+                                  misfire_grace_time=3600)
+        entry.next_run_at = now - timedelta(seconds=60)
+
+        assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+        assert not scheduler.skipped_runs()
+
+    def test_misfire_without_next_run_at_is_sent(self):
+        # the scheduled time of the run is unknown (e.g. the schedule
+        # was written by an older version): dispatch as usual.
+        scheduler = mScheduler(app=self.app)
+        now = datetime.now(timezone.utc)
+        entry, _ = self.add_entry(scheduler, 'unknown-scheduled-at', now,
+                                  misfire_grace_time=1)
+        assert entry.next_run_at is None
+
+        assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+        assert not scheduler.skipped_runs()
+
+    def test_tick_records_next_run_at(self):
+        scheduler = mScheduler(app=self.app)
+        now = datetime.now(timezone.utc)
+        self.add_entry(scheduler, 'entry', now)
+
+        assert scheduler.tick() == 0
+        current = scheduler.schedule['entry']
+        assert current.next_run_at == now + timedelta(seconds=300)
+
+    def test_no_overlap_skips_while_previous_run_active(self):
+        scheduler = mScheduler(app=self.app)
+        now = datetime.now(timezone.utc)
+        self.add_entry(scheduler, 'serial', now, no_overlap=True)
+
+        # first run is dispatched and its task id is tracked.
+        assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+        current = scheduler.schedule['serial']
+        assert current.last_task_id
+
+        # the previous run is still active: the next run is skipped.
+        self.app.backend.store_result(current.last_task_id, None, 'STARTED')
+        assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 1
+
+        skipped = scheduler.skipped_runs()
+        assert len(skipped) == 1
+        record = skipped[0]
+        assert record.entry == 'serial'
+        assert record.reason == beat.SKIP_REASON_OVERLAP
+        assert record.missed_count == 1
+        assert scheduler.schedule['serial'].total_skip_count == 1
+
+    def test_no_overlap_sends_when_previous_run_finished(self):
+        scheduler = mScheduler(app=self.app)
+        now = datetime.now(timezone.utc)
+        self.add_entry(scheduler, 'serial', now, no_overlap=True)
+
+        assert scheduler.tick() == 0
+        current = scheduler.schedule['serial']
+        self.app.backend.store_result(
+            current.last_task_id, 'result', 'SUCCESS')
+
+        assert scheduler.tick() == 0
+        assert len(scheduler.sent) == 2
+        assert not scheduler.skipped_runs()
+
+    def test_no_overlap_without_backend_sends_and_warns(self):
+        self.app.conf.result_backend = 'disabled'
+        scheduler = mScheduler(app=self.app)
+        now = datetime.now(timezone.utc)
+        self.add_entry(scheduler, 'serial', now, no_overlap=True)
+
+        assert scheduler.tick() == 0
+        assert scheduler.schedule['serial'].last_task_id
+
+        with patch('celery.beat.warning') as warning:
+            assert scheduler.tick() == 0
+            warning.assert_called_once()
+        assert len(scheduler.sent) == 2
+
+        # the warning is only emitted once per entry.
+        with patch('celery.beat.warning') as warning:
+            assert scheduler.tick() == 0
+            warning.assert_not_called()
+        assert len(scheduler.sent) == 3
+
+    def test_skipped_runs_filtered_by_entry_name(self):
+        scheduler = mScheduler(app=self.app)
+        now = datetime.now(timezone.utc)
+        for name in ('a', 'b'):
+            entry, _ = self.add_entry(scheduler, name, now,
+                                      misfire_grace_time=60)
+            entry.next_run_at = now - timedelta(seconds=3600)
+
+        scheduler.tick()
+        scheduler.tick()
+        assert not scheduler.sent
+        assert len(scheduler.skipped_runs()) == 2
+        a_skips = scheduler.skipped_runs('a')
+        assert len(a_skips) == 1
+        assert a_skips[0].entry == 'a'
+        assert not scheduler.skipped_runs('no-such-entry')
+
+
 def create_persistent_scheduler(shelv=None):
     if shelv is None:
         shelv = MockShelve()
@@ -811,6 +1017,41 @@ class test_PersistentScheduler:
             item['task'] for item in scheduler.sent}
         # ensure next call on the beginning of next min
         assert abs(60 - cur_seconds - delay) < 1
+
+    def test_skip_records_persisted_and_reloaded(self):
+        shelv = MockShelve()
+
+        class MockPersistentScheduler(beat.PersistentScheduler):
+            persistence = Bunch(open=lambda *a, **kw: shelv)
+
+            def __init__(self, *args, **kwargs):
+                self.sent = []
+                super().__init__(*args, **kwargs)
+
+            def send_task(self, task=None, args=None, kwargs=None,
+                          **options):
+                self.sent.append(task)
+                return self.app.AsyncResult(uuid())
+
+        now = datetime.now(timezone.utc)
+        sched = mocked_schedule(True, 300, nowfun=lambda: now)
+        scheduler = MockPersistentScheduler(app=self.app,
+                                            schedule_filename='schedule')
+        entry = scheduler.add(name='late', task='tasks.add', schedule=sched,
+                              misfire_grace_time=60)
+        entry.next_run_at = now - timedelta(seconds=3600)
+
+        assert scheduler.tick() == 0
+        assert not scheduler.sent
+        assert len(shelv['skipped_runs']) == 1
+
+        # a new scheduler over the same database sees the records.
+        scheduler2 = MockPersistentScheduler(app=self.app,
+                                             schedule_filename='schedule')
+        skipped = scheduler2.skipped_runs()
+        assert len(skipped) == 1
+        assert skipped[0].entry == 'late'
+        assert skipped[0].reason == beat.SKIP_REASON_MISFIRE
 
 
 class test_Service:
